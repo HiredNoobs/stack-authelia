@@ -1,0 +1,55 @@
+# Authelia config, rendered by 'deploy' (envsubst, only the stack's variables are replaced).
+# Secrets aren't in here, they're mounted from the authelia Secret and passed with the
+# AUTHELIA_*_FILE env vars in k8s/authelia.yaml.
+#
+# https://www.authelia.com/configuration/prologue/introduction/
+
+server:
+  address: 'tcp://:9091/'
+
+log:
+  level: 'info'
+  format: 'json'
+
+theme: 'auto'
+
+totp:
+  issuer: '${DOMAIN}'
+
+webauthn:
+  display_name: '${DOMAIN}'
+
+authentication_backend:
+  # The authelia user is in lldap_strict_readonly, so it can't change passwords. They're
+  # reset in LLDAP's UI (lldap.${DOMAIN}) instead.
+  password_reset:
+    disable: true
+  ldap:
+    implementation: 'lldap'
+    address: '${AUTHELIA_LDAP_ADDRESS}'
+    base_dn: '${AUTHELIA_LDAP_BASE_DN}'
+    user: 'uid=${AUTHELIA_LDAP_USER},ou=people,${AUTHELIA_LDAP_BASE_DN}'
+
+session:
+  cookies:
+    - domain: '${DOMAIN}'
+      authelia_url: 'https://auth.${DOMAIN}'
+      default_redirection_url: 'https://${AUTHELIA_DEFAULT_REDIRECT}.${DOMAIN}'
+
+storage:
+  local:
+    path: '/data/db.sqlite3'
+
+# One-time codes (e.g. registering 2FA) are written here rather than emailed, read them with
+# 'deployment authelia_notifications'.
+notifier:
+  filesystem:
+    filename: '/data/notification.txt'
+
+# Nothing is protected until it's added in stack-nginx, this is who gets in once it is.
+access_control:
+  default_policy: 'deny'
+  rules:
+    - domain: '*.${DOMAIN}'
+      subject: 'group:admins'
+      policy: 'two_factor'

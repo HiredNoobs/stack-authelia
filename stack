@@ -1,0 +1,174 @@
+#!/usr/bin/env bash
+#
+# Authelia. A single instance StatefulSet (SQLite) on a node labelled ${STACK}_authelia, with
+# its data on a persistent volume. Users and groups are in LLDAP (stack-lldap). The portal is
+# reached through nginx as auth.$DOMAIN.
+
+# Variables substituted in k8s/*.yaml, anything else is left alone.
+K8S_TEMPLATE_VARS='$STACK $AUTHELIA_IMAGE $AUTHELIA_CONFIG_CHECKSUM $AUTHELIA_STORAGE_CLASS $AUTHELIA_VOLUME_SIZE'
+
+# Variables substituted in configs/configuration.yml.tmpl.
+CONFIG_TEMPLATE_VARS='$DOMAIN $AUTHELIA_LDAP_ADDRESS $AUTHELIA_LDAP_BASE_DN $AUTHELIA_LDAP_USER $AUTHELIA_DEFAULT_REDIRECT'
+
+# -----------------------------------------------------
+# Helper functions
+# -----------------------------------------------------
+
+function check_stack_context {
+  local var
+
+  if [[ -z "${DOMAIN:-}" ]]; then
+    log_error "DOMAIN isn't set, Authelia needs it for its URL (https://auth.\$DOMAIN) and the session cookie."
+    exit 1
+  fi
+
+  for var in AUTHELIA_JWT_SECRET AUTHELIA_SESSION_SECRET AUTHELIA_STORAGE_ENCRYPTION_KEY AUTHELIA_LDAP_PASSWORD; do
+    if [[ -z "${!var:-}" ]]; then
+      log_error "$var missing from 'secrets.env'."
+      exit 1
+    fi
+  done
+
+  if (( ${#AUTHELIA_STORAGE_ENCRYPTION_KEY} < 20 )); then
+    log_error "AUTHELIA_STORAGE_ENCRYPTION_KEY must be at least 20 characters."
+    exit 1
+  fi
+
+  k8s_require_longhorn "$AUTHELIA_STORAGE_CLASS"
+  require_lldap
+}
+
+# Authelia checks LDAP when it starts and won't carry on without it.
+function require_lldap {
+  local host namespace ready
+
+  # ldap://lldap.lldap-core.svc.cluster.local:3890 -> lldap-core
+  host="${AUTHELIA_LDAP_ADDRESS#*://}"
+  namespace=$(cut -d. -f2 <<< "${host%%:*}")
+
+  ready=$(kubectl get statefulset lldap --namespace "$namespace" -o jsonpath='{.status.readyReplicas}' 2> /dev/null)
+
+  if [[ -z "$ready" || "$ready" -eq 0 ]]; then
+    log_error "LLDAP isn't ready in $namespace, deploy stack-lldap first."
+    exit 1
+  fi
+}
+
+function render {
+  envsubst "$K8S_TEMPLATE_VARS" < "$STACK_PATH/k8s/$1"
+}
+
+# Everything that needs a restart when it changes.
+function config {
+  local outdir="$1"
+
+  envsubst "$CONFIG_TEMPLATE_VARS" < "$CONFIGS/configuration.yml.tmpl" > "$outdir/configuration.yml"
+
+  kubectl create configmap authelia-config \
+    --from-file=configuration.yml="$outdir/configuration.yml" \
+    --dry-run=client -o yaml
+  echo "---"
+  kubectl create secret generic authelia \
+    --from-literal=jwt-secret="$AUTHELIA_JWT_SECRET" \
+    --from-literal=session-secret="$AUTHELIA_SESSION_SECRET" \
+    --from-literal=storage-encryption-key="$AUTHELIA_STORAGE_ENCRYPTION_KEY" \
+    --from-literal=ldap-password="$AUTHELIA_LDAP_PASSWORD" \
+    --dry-run=client -o yaml
+}
+
+# -----------------------------------------------------
+# Override functions
+# -----------------------------------------------------
+
+# Keeps the namespace and the volume, so the 2FA registrations survive a redeploy.
+function run_clean {
+  log_info "'clean' has been overridden by stack."
+  log_info "Removing Authelia (namespace $K8S_NAMESPACE), keeping the data volume."
+  kubectl delete statefulset/authelia service/authelia configmap/authelia-config secret/authelia \
+    --namespace "$K8S_NAMESPACE" --ignore-not-found --wait=true
+}
+
+# Deleting the namespace removes the volume, and every 2FA registration with it.
+function run_purge {
+  log_info "'purge' has been overridden by stack."
+  log_warning "Removing namespace $K8S_NAMESPACE, including the data volume."
+  orchestrator_clean
+  orchestrator_purge
+}
+
+# -----------------------------------------------------
+# Commands
+# -----------------------------------------------------
+
+# The notifier writes to a file rather than sending emails, this shows the latest one, e.g.
+# the one-time code for registering 2FA.
+function command_authelia_notifications {
+  discover_stack_context
+
+  kubectl exec authelia-0 --namespace "$K8S_NAMESPACE" -- cat /data/notification.txt
+}
+
+# -----------------------------------------------------
+# Stack functions
+# -----------------------------------------------------
+
+function stack_check_env {
+  if [ ! -d "$CONFIGS" ] || [ ! -d "$SECRETS" ]; then
+    echo "Configs or secrets directory are missing from '$ENVIRONMENT_BASE'."
+    exit 1
+  fi
+}
+
+function stack_discover {
+  local domain="${DOMAIN:-}"
+
+  export AUTHELIA_NODE_COUNT=$(count "$AUTHELIA_NODES")
+  # example.com -> dc=example,dc=com, the same as stack-lldap.
+  export AUTHELIA_LDAP_BASE_DN="dc=${domain//./,dc=}"
+}
+
+function stack_env {
+  echo
+  echo "AUTHELIA IMAGE = $AUTHELIA_IMAGE"
+  echo "AUTHELIA NODES = ($AUTHELIA_NODE_COUNT)"
+  list "$AUTHELIA_NODES"
+  echo
+  echo "URL            = https://auth.${DOMAIN:-}"
+  echo "LDAP           = $AUTHELIA_LDAP_ADDRESS"
+  echo "LDAP USER      = uid=$AUTHELIA_LDAP_USER,ou=people,$AUTHELIA_LDAP_BASE_DN"
+  echo "STORAGE CLASS  = $AUTHELIA_STORAGE_CLASS ($AUTHELIA_VOLUME_SIZE)"
+  echo
+}
+
+function stack_deploy {
+  local outdir manifests_config
+
+  check_stack_context
+
+  if (( AUTHELIA_NODE_COUNT == 0 )); then
+    log_error "No nodes are labelled ${STACK}_authelia."
+    exit 1
+  elif (( AUTHELIA_NODE_COUNT > 1 )); then
+    log_warning "$AUTHELIA_NODE_COUNT nodes are labelled ${STACK}_authelia, it uses SQLite so a single instance runs on one of them."
+  fi
+
+  outdir=$(mktemp -d)
+  manifests_config=$(config "$outdir")
+  rm -rf "$outdir"
+
+  export AUTHELIA_CONFIG_CHECKSUM=$(sha256sum <<< "$manifests_config" | cut -d' ' -f1)
+
+  log_info "Deploying Authelia to $K8S_NAMESPACE."
+  {
+    echo "$manifests_config"
+    echo "---"
+    render service.yaml
+    echo "---"
+    render authelia.yaml
+  } | kubectl apply --namespace "$K8S_NAMESPACE" -f -
+
+  if ! kubectl rollout status statefulset/authelia --namespace "$K8S_NAMESPACE" --timeout=10m; then
+    log_error "Authelia isn't ready, check its logs (kubectl logs authelia-0 -n $K8S_NAMESPACE) and the PVC."
+    exit 1
+  fi
+}
